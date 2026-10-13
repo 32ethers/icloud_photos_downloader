@@ -2,7 +2,9 @@ import base64
 import copy
 import json
 import logging
+import os
 import re
+import time
 import typing
 from datetime import datetime
 from typing import Any, Callable, Dict, Generator, Sequence, Tuple, cast
@@ -21,9 +23,6 @@ from pyicloud_ipd.asset_version import (
     AssetVersion,
     add_suffix_to_filename,
     calculate_version_filename,
-)
-from pyicloud_ipd.exceptions import (
-    PyiCloudServiceNotActivatedException,
 )
 from pyicloud_ipd.file_match import FileMatchPolicy
 from pyicloud_ipd.item_type import AssetItemType
@@ -292,13 +291,31 @@ class PhotoLibrary:
             }
         )
 
-        request = self.session.post(url, data=json_data, headers={"Content-type": "text/plain"})
-        response = request.json()
-        indexing_state = response["records"][0]["fields"]["state"]["value"]
-        if indexing_state != "FINISHED":
-            raise PyiCloudServiceNotActivatedException(
-                ("Apple iCloud Photo Library has not finished indexing yet"), None
+        # Local patch: while iCloud reports that the photo library is still indexing,
+        # keep re-checking every ICLOUDPD_INDEXING_RETRY_SECONDS seconds (default 10)
+        # instead of failing the run and waiting for the next scheduled cycle.
+        # Messages use WARNING: icloudpd calls logging.basicConfig() without a level, so the
+        # root logger stays at WARNING and INFO records from this module are filtered out.
+        retry_interval = int(os.environ.get("ICLOUDPD_INDEXING_RETRY_SECONDS", "10"))
+        attempt = 0
+        while True:
+            attempt += 1
+            request = self.session.post(
+                url, data=json_data, headers={"Content-type": "text/plain"}
             )
+            response = request.json()
+            indexing_state = response["records"][0]["fields"]["state"]["value"]
+            if indexing_state == "FINISHED":
+                if attempt > 1:
+                    logger.warning("iCloud Photo Library indexing finished, continuing with the download")
+                break
+            logger.warning(
+                "iCloud Photo Library has not finished indexing yet (state=%s), retrying in %s seconds (attempt %s)",
+                indexing_state,
+                retry_interval,
+                attempt,
+            )
+            time.sleep(retry_interval)
 
     @property
     def albums(self) -> Dict[str, "PhotoAlbum"]:
